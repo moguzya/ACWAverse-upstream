@@ -35,6 +35,13 @@ ACWAverse addresses these critical challenges by providing a comprehensive simul
 - Chemical dosing and chemical interference are bounded, abstract state perturbations (`ΔpH` and `Δmg/L`) applied to tanks. They are not mass-dose, buffering, or reaction-equilibrium models.
 - Imported attack scenarios are validated against target component types, available numeric sensors, simulation duration, and finite parameter values before execution.
 
+### Hydraulic Topology Semantics
+
+- Sources are origin-only and sinks are destination-only. Tanks, pumps, valves, and junctions can be connected to one another in any directed order; self-connections, duplicate pipes, dangling endpoints, incoming source pipes, and outgoing sink pipes are rejected.
+- Tanks are hydraulic storage boundaries. Water entering a tank is stored and can feed a downstream segment during the same or a later interval.
+- Pumps connected in series contribute combined head while retaining each pump's capacity limit. Shared pumps, valves, and pipes constrain the total flow across branches, and graph cycles are traversed safely without recursion loops.
+- Each interval records pipe, pump, valve, and junction flow rates. Sources track cumulative `suppliedVolume`; sinks track cumulative `receivedVolume`; tanks track cumulative `leakedVolume` and `overflowVolume` for mass-balance auditing.
+
 ---
 
 ## System Architecture

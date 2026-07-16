@@ -23,12 +23,25 @@ function attackStartTime(attack) {
 
 const POISONABLE_SENSOR_FIELDS = {
     tank: ['waterLevel', 'waterAmount', 'temperature', 'ph', 'o2', 'bodn', 'nitrate', 'co2'],
-    source: ['waterLevel', 'temperature', 'ph', 'o2', 'bodn', 'nitrate', 'co2', 'head'],
+    source: ['waterLevel', 'temperature', 'ph', 'o2', 'bodn', 'nitrate', 'co2', 'head', 'suppliedVolume'],
     pump: ['power', 'flowRate', 'efficiency', 'headGain', 'head'],
     valve: ['flowRate', 'opening'],
-    sink: ['head'],
-    junction: ['head']
+    sink: ['head', 'receivedVolume'],
+    junction: ['head', 'flowRate']
 };
+
+function validateNetworkList(targetNetwork) {
+    if (!window.ACWAEngine || typeof ACWAEngine.validateNetworkConnections !== 'function') return [];
+    return ACWAEngine.validateNetworkConnections(targetNetwork);
+}
+
+function initializeTransportSensorFields(targetNetwork) {
+    (targetNetwork.components || []).forEach(component => {
+        if (component.type === 'source' && !Number.isFinite(component.suppliedVolume)) component.suppliedVolume = 0;
+        if (component.type === 'sink' && !Number.isFinite(component.receivedVolume)) component.receivedVolume = 0;
+        if (['pump', 'valve', 'junction'].includes(component.type) && !Number.isFinite(component.flowRate)) component.flowRate = 0;
+    });
+}
 
 function validateAttackList(targetNetwork, attacks, duration) {
     if (!window.ACWAEngine || typeof ACWAEngine.validateAttackScenarios !== 'function') return [];
@@ -654,6 +667,11 @@ function loadSystem(systemData) {
     const nextNetwork = systemData.network || { components: [], pipes: [] };
     const nextAttacks = systemData.attackScenarios || [];
     const nextSettings = systemData.simulationSettings || { duration: 600, ambientTemp: 20 };
+    const networkErrors = validateNetworkList(nextNetwork);
+    if (networkErrors.length) {
+        throw new Error(`Invalid network connections:\n${networkErrors.join('\n')}`);
+    }
+    initializeTransportSensorFields(nextNetwork);
     const attackErrors = validateAttackList(nextNetwork, nextAttacks, Number(nextSettings.duration));
     if (attackErrors.length) {
         throw new Error(`Invalid attack scenarios:\n${attackErrors.join('\n')}`);
@@ -781,6 +799,17 @@ function addComponent(type, options = {}) {
         component.isOpen = true;
         component.flowRate = 0;
     }
+    if (type === 'source') {
+        component.head = component.head !== undefined ? component.head : 10;
+        component.suppliedVolume = 0;
+    }
+    if (type === 'sink') {
+        component.head = component.head !== undefined ? component.head : 0;
+        component.receivedVolume = 0;
+    }
+    if (type === 'junction') {
+        component.flowRate = 0;
+    }
 
     network.components.push(component);
     updateVisualization();
@@ -836,8 +865,9 @@ function generateConnectivityMatrix() {
         network.components.forEach(toComp => {
             const cell = document.createElement('td');
             
-            // Don't allow self-connections
-            if (fromComp.id === toComp.id) {
+            const connectionAllowed = fromComp.id !== toComp.id &&
+                ACWAEngine.isConnectionAllowed(fromComp.type, toComp.type);
+            if (!connectionAllowed) {
                 cell.innerHTML = '<span class="text-gray-400">-</span>';
             } else {
                 // Check if this connection already exists
@@ -866,6 +896,13 @@ function generateConnectivityMatrix() {
 
 function handleConnectionChange(fromId, toId, isConnected) {
     if (isConnected) {
+        const fromComp = network.components.find(component => component.id === fromId);
+        const toComp = network.components.find(component => component.id === toId);
+        if (!fromComp || !toComp || fromId === toId || !ACWAEngine.isConnectionAllowed(fromComp.type, toComp.type)) {
+            generateConnectivityMatrix();
+            return;
+        }
+        if (network.pipes.some(pipe => pipe.from === fromId && pipe.to === toId)) return;
         // Add connection
         const pipeId = `pipe_${network.pipes.length + 1}`;
         network.pipes.push({ id: pipeId, from: fromId, to: toId });
@@ -1907,11 +1944,16 @@ function renderAnalysisCharts() {
     chartsContainer.innerHTML = '';
 
     const timeData = lastSimulationResults.map(d => d.time);
-    const parameters = ['waterLevel', 'waterAmount', 'power', 'temperature', 'ph', 'o2', 'bodn', 'nitrate', 'co2'];
+    const parameters = ['waterLevel', 'waterAmount', 'power', 'flowRate', 'suppliedVolume', 'receivedVolume', 'leakedVolume', 'overflowVolume', 'temperature', 'ph', 'o2', 'bodn', 'nitrate', 'co2'];
     const units = {
         waterLevel: '(m)',
         waterAmount: '(m³)',
         power: '(%)',
+        flowRate: '(m³/s)',
+        suppliedVolume: '(m³)',
+        receivedVolume: '(m³)',
+        leakedVolume: '(m³)',
+        overflowVolume: '(m³)',
         temperature: '(°C)',
         ph: '(pH)',
         o2: '(mg/L)',
@@ -2123,6 +2165,11 @@ function startSimulation() {
         }
     });
 
+    const networkErrors = validateNetworkList(network);
+    if (networkErrors.length) {
+        alert(`Invalid network connections:\n${networkErrors.join('\n')}`);
+        return;
+    }
     const attackErrors = validateAttackList(network, attackScenarios, duration);
     if (attackErrors.length) {
         alert(`Invalid attack scenarios:\n${attackErrors.join('\n')}`);

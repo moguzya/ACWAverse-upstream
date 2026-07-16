@@ -1129,6 +1129,261 @@ async function main() {
     assert.strictEqual(valve.stuck, true);
   });
 
+  function transportComponent(type, id, isOriginTank = false){
+    if (type === 'source') return {id, type, head:10, temperature:20, ph:7, o2:8, bodn:2, nitrate:1, co2:5};
+    if (type === 'sink') return {id, type, head:0};
+    if (type === 'tank') return {
+      id,
+      type,
+      shape:'rectangular',
+      width:1,
+      height:1,
+      maxLevel:100,
+      waterAmount:isOriginTank ? 10 : 0,
+      waterLevel:isOriginTank ? 10 : 0,
+      temperature:20,
+      ph:7,
+      o2:8,
+      bodn:2,
+      nitrate:1,
+      co2:5
+    };
+    if (type === 'pump') return {id, type, maxFlowRate:1, power:100, headGain:20};
+    if (type === 'valve') return {id, type, isOpen:true, opening:1, maxFlowRate:10};
+    return {id, type, flowRate:0};
+  }
+
+  function buildPairNetwork(fromType, toType){
+    const components = [];
+    const orderedIds = [];
+    if (fromType !== 'source' && fromType !== 'tank'){
+      components.push(transportComponent('source', 'origin'));
+      orderedIds.push('origin');
+    }
+    components.push(transportComponent(fromType, 'from', fromType === 'tank'));
+    orderedIds.push('from');
+    components.push(transportComponent(toType, 'to'));
+    orderedIds.push('to');
+    if (toType !== 'tank' && toType !== 'sink'){
+      components.push(transportComponent('sink', 'destination'));
+      orderedIds.push('destination');
+    }
+    return {
+      components,
+      pipes: orderedIds.slice(0, -1).map((id, index) => ({
+        id:`pipe_${index + 1}`,
+        from:id,
+        to:orderedIds[index + 1],
+        hw:{K:0.1, n:1},
+        maxFlowRate:10
+      }))
+    };
+  }
+
+  test('all 25 valid ordered component-type connections transport water in context', () => {
+    const fromTypes = ['source', 'tank', 'pump', 'valve', 'junction'];
+    const toTypes = ['tank', 'pump', 'valve', 'junction', 'sink'];
+    const failures = [];
+    fromTypes.forEach(fromType => {
+      toTypes.forEach(toType => {
+        const network = buildPairNetwork(fromType, toType);
+        try {
+          assert.deepStrictEqual(Array.from(E.validateNetworkConnections(network)), []);
+          const out = E.run(network, [], [], [], 1, 20, 1);
+          const destinationId = toType === 'tank' ? 'to' : (toType === 'sink' ? 'to' : 'destination');
+          const destination = out.simNetwork.components.find(component => component.id === destinationId);
+          const delivered = destination.type === 'tank' ? destination.waterAmount : destination.receivedVolume;
+          if (!(delivered > 0)) failures.push(`${fromType}->${toType}: no delivered water`);
+          const testedPipe = out.simNetwork.pipes.find(pipe => pipe.from === 'from' && pipe.to === 'to');
+          if (!testedPipe || !(testedPipe.flowRate > 0)) failures.push(`${fromType}->${toType}: connecting pipe has no flow`);
+          if (testedPipe && !(out.results[1][`${testedPipe.id}_flowRate`] > 0)) failures.push(`${fromType}->${toType}: pipe flow is absent from results`);
+        } catch (error) {
+          failures.push(`${fromType}->${toType}: ${error.message}`);
+        }
+      });
+    });
+    assert.deepStrictEqual(failures, []);
+  });
+
+  test('connection policy rejects every incoming-source and outgoing-sink pair', () => {
+    const types = ['source', 'tank', 'pump', 'valve', 'junction', 'sink'];
+    let allowed = 0;
+    let rejected = 0;
+    types.forEach(fromType => {
+      types.forEach(toType => {
+        const expected = fromType !== 'sink' && toType !== 'source';
+        assert.strictEqual(E.isConnectionAllowed(fromType, toType), expected, `${fromType}->${toType}`);
+        const network = {
+          components: [transportComponent(fromType, 'from'), transportComponent(toType, 'to')],
+          pipes: [{from:'from', to:'to'}]
+        };
+        const errors = E.validateNetworkConnections(network);
+        if (expected){
+          allowed++;
+          assert.deepStrictEqual(Array.from(errors), [], `${fromType}->${toType}`);
+        } else {
+          rejected++;
+          assert.ok(errors.length > 0, `${fromType}->${toType}`);
+        }
+      });
+    });
+    assert.strictEqual(allowed, 25);
+    assert.strictEqual(rejected, 11);
+  });
+
+  test('network validation rejects dangling, self, and duplicate pipes', () => {
+    const network = {
+      components: [transportComponent('source', 'source'), transportComponent('sink', 'sink')],
+      pipes: [
+        {from:'source', to:'sink'},
+        {from:'source', to:'sink'},
+        {from:'source', to:'missing'},
+        {from:'sink', to:'sink'}
+      ]
+    };
+    const errors = E.validateNetworkConnections(network);
+    assert.ok(errors.some(error => error.includes('duplicate connection')));
+    assert.ok(errors.some(error => error.includes('does not exist')));
+    assert.ok(errors.some(error => error.includes('self-connections')));
+    assert.throws(() => E.run(network, [], [], [], 1, 20, 1), /Invalid network connections/);
+  });
+
+  function buildSeriesNetwork(options = {}){
+    const opening = options.opening === undefined ? 1 : options.opening;
+    return {
+      components: [
+        transportComponent('source', 'source'),
+        {...transportComponent('pump', 'pump_1'), maxFlowRate:1},
+        {id:'junction_1', type:'junction'},
+        {...transportComponent('valve', 'valve'), opening, isOpen:opening > 0},
+        {...transportComponent('pump', 'pump_2'), maxFlowRate:1},
+        {id:'junction_2', type:'junction'},
+        transportComponent('sink', 'sink')
+      ],
+      pipes: [
+        {from:'source', to:'pump_1', maxFlowRate:options.sharedPipeLimit || 10, hw:{K:0.1, n:1}},
+        {from:'pump_1', to:'junction_1', hw:{K:0.1, n:1}},
+        {from:'junction_1', to:'valve', hw:{K:0.1, n:1}},
+        {from:'valve', to:'pump_2', hw:{K:0.1, n:1}},
+        {from:'pump_2', to:'junction_2', hw:{K:0.1, n:1}},
+        {from:'junction_2', to:'junction_1', hw:{K:0.1, n:1}},
+        {from:'junction_2', to:'sink', hw:{K:0.1, n:1}}
+      ]
+    };
+  }
+
+  test('series pumps traverse direct-compatible nodes and terminate safely around a cycle', () => {
+    const out = E.run(buildSeriesNetwork(), [], [], [], 1, 20, 1);
+    const sink = out.simNetwork.components.find(component => component.id === 'sink');
+    const pump1 = out.simNetwork.components.find(component => component.id === 'pump_1');
+    const pump2 = out.simNetwork.components.find(component => component.id === 'pump_2');
+    assert.ok(sink.receivedVolume > 0);
+    assert.ok(pump1.flowRate > 0);
+    assert.ok(approxEqual(pump1.flowRate, pump2.flowRate, 1e-9));
+  });
+
+  test('shared pump and pipe capacities constrain all series-pump branches', () => {
+    const network = buildSeriesNetwork({sharedPipeLimit:0.4});
+    network.components = network.components.filter(component => component.id !== 'sink');
+    network.components.push(transportComponent('sink', 'sink_left'), transportComponent('sink', 'sink_right'));
+    network.pipes = network.pipes.filter(pipe => pipe.to !== 'sink');
+    network.pipes.push(
+      {from:'junction_2', to:'sink_left', hw:{K:0.1, n:1}},
+      {from:'junction_2', to:'sink_right', hw:{K:0.1, n:1}}
+    );
+    const out = E.run(network, [], [], [], 1, 20, 1);
+    const left = out.simNetwork.components.find(component => component.id === 'sink_left').receivedVolume;
+    const right = out.simNetwork.components.find(component => component.id === 'sink_right').receivedVolume;
+    assert.ok(left > 0 && right > 0);
+    assert.ok(left + right <= 0.4 + 1e-9);
+    assert.ok(out.simNetwork.components.find(component => component.id === 'pump_1').flowRate <= 0.4 + 1e-9);
+  });
+
+  test('pump failure and stuck-valve attacks have sane effects on a series path', () => {
+    const baseline = E.run(buildSeriesNetwork(), [], [], [], 1, 20, 1).simNetwork;
+    const failed = E.run(
+      buildSeriesNetwork(),
+      [],
+      [],
+      [{time:0, type:'physical_damage', componentId:'pump_2', damageType:'pump_failure'}],
+      1,
+      20,
+      1
+    ).simNetwork;
+    const partial = E.run(
+      buildSeriesNetwork({opening:0.4}),
+      [],
+      [],
+      [{time:0, type:'physical_damage', componentId:'valve', damageType:'valve_stuck'}],
+      1,
+      20,
+      1
+    ).simNetwork;
+    const closed = E.run(
+      buildSeriesNetwork({opening:0}),
+      [],
+      [],
+      [{time:0, type:'physical_damage', componentId:'valve', damageType:'valve_stuck'}],
+      1,
+      20,
+      1
+    ).simNetwork;
+    const received = result => result.components.find(component => component.type === 'sink').receivedVolume;
+    assert.ok(received(baseline) > 0);
+    assert.strictEqual(received(failed), 0);
+    assert.strictEqual(received(closed), 0);
+    assert.ok(received(partial) > 0 && received(partial) < received(baseline));
+  });
+
+  test('poisoned transport sensor can stop a series path through conditional control', () => {
+    const network = buildSeriesNetwork();
+    const attacks = [{time:0, type:'data_poisoning', componentId:'source', poisonType:'suppliedVolume', value:99, duration:1}];
+    const rules = [{
+      source:{componentId:'source', value:'suppliedVolume'},
+      condition:{operator:'>', threshold:50},
+      target:{componentId:'pump_2', actionType:'emergency_stop', params:{}}
+    }];
+    const out = E.run(network, [], rules, attacks, 1, 20, 1);
+    assert.strictEqual(out.results[0].source_suppliedVolume, 0);
+    assert.strictEqual(out.results[0].source_suppliedVolume_reported, 99);
+    assert.strictEqual(out.simNetwork.components.find(component => component.id === 'pump_2').power, 0);
+    assert.strictEqual(out.simNetwork.components.find(component => component.id === 'sink').receivedVolume, 0);
+  });
+
+  test('source, sink, leak, and storage counters close the attacked-system mass balance', () => {
+    const network = {
+      components: [
+        transportComponent('source', 'source'),
+        transportComponent('pump', 'pump_in'),
+        transportComponent('tank', 'tank'),
+        {...transportComponent('pump', 'pump_out'), maxFlowRate:0.2},
+        transportComponent('sink', 'sink')
+      ],
+      pipes: [
+        {from:'source', to:'pump_in', hw:{K:0.1, n:1}},
+        {from:'pump_in', to:'tank', hw:{K:0.1, n:1}},
+        {from:'tank', to:'pump_out', hw:{K:0.1, n:1}},
+        {from:'pump_out', to:'sink', hw:{K:0.1, n:1}}
+      ]
+    };
+    const attacks = [{time:0, type:'physical_damage', componentId:'tank', damageType:'leak', leakRate:0.1, duration:2}];
+    const out = E.run(network, [], [], attacks, 2, 20, 1).simNetwork;
+    const source = out.components.find(component => component.id === 'source');
+    const tank = out.components.find(component => component.id === 'tank');
+    const sink = out.components.find(component => component.id === 'sink');
+    const accounted = tank.waterAmount + sink.receivedVolume + tank.leakedVolume + (tank.overflowVolume || 0);
+    assert.ok(source.suppliedVolume > 0);
+    assert.ok(tank.leakedVolume > 0);
+    assert.ok(approxEqual(source.suppliedVolume, accounted, 1e-9));
+  });
+
+  test('UI delegates connection availability and import validation to the engine', () => {
+    const uiCode = fs.readFileSync(path.resolve(__dirname, '../acwa.js'), 'utf8');
+    assert.match(uiCode, /ACWAEngine\.isConnectionAllowed\(fromComp\.type, toComp\.type\)/);
+    assert.match(uiCode, /validateNetworkList\(nextNetwork\)/);
+    assert.match(uiCode, /validateNetworkList\(network\)/);
+  });
+
   // Performance smoke  (small)
   test('performance smoke (50 ticks, 30 comps)', () => {
     const comps = [];
